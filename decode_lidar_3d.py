@@ -28,7 +28,7 @@ def decode_packet(packet: bytes) -> dict:
 
     # DataInfo (16 B at offset 12)
     seq, payload_size, sec, nsec = struct.unpack_from("<IIII", payload, 12)
-    # Danity check: payload_size == packet_size - header(12) - tail(12)
+    # Sanity check: payload_size == packet_size - header(12) - tail(12)
     if payload_size != packet_size - 24:
         raise ValueError(f"payload_size mismatch: header says {payload_size}, expected {packet_size - 24}")
 
