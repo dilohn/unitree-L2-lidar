@@ -1,121 +1,156 @@
 import struct
 import binascii
-import numpy as np
 
+MAGIC = b"\x55\xAA\x05\x0A"
+EXPECTED_TYPE = 102  # 3D point packet type, no IMU
 
 def decode_packet(packet: bytes) -> dict:
-    if len(packet) != 1044:
-        raise ValueError(f"Expected 1044 bytes, got {len(packet)}")
+    # Minimal length: UDP header (8) + FrameHeader (12) + FrameTail (12)
+    if len(packet) < 8 + 12 + 12:
+        raise ValueError(f"Packet too short, got {len(packet)} bytes")
 
-    if packet[0:4] != b"\x55\xaa\x05\x0a":
-        raise ValueError("Bad magic header")
-    packet_type, packet_size = struct.unpack_from("<II", packet, 4)
+    # Parse UDP header (big-endian)
+    src_port, dst_port, udp_length, udp_checksum = struct.unpack("!HHHH", packet[:8])
 
-    off = 12
-    seq, payload_size, stamp_sec, stamp_nsec = struct.unpack_from("<IIII", packet, off)
-    off += 16
+    # Strip off UDP header
+    payload = packet[8:]
 
-    sys_rot_period, com_rot_period = struct.unpack_from("<II", packet, off)
-    temps_voltages = struct.unpack_from("<7f", packet, off + 8)
-    off += 36
+    # Parse FrameHeader (little-endian)
+    magic, packet_type, packet_size = struct.unpack_from("<4sII", payload, 0)
+    if magic != MAGIC:
+        raise ValueError(f"Bad magic: {magic!r}")
+    if packet_type != EXPECTED_TYPE:
+        raise ValueError(f"Unexpected packet_type: {packet_type}")
 
-    calib_keys = (
-        "a_axis_dist",
-        "b_axis_dist",
-        "theta_bias",
-        "alpha_bias",
-        "beta_angle",
-        "xi_angle",
-        "range_bias",
-        "range_scale",
-    )
-    calib_vals = struct.unpack_from("<8f", packet, off)
-    calibration = dict(zip(calib_keys, calib_vals))
-    off += 32
+    # Ensure payload length matches the header’s packet_size
+    if len(payload) != packet_size:
+        raise ValueError(f"Payload size mismatch: header says {packet_size}, actual {len(payload)}")
 
-    scan_keys = (
-        "horiz_start",
-        "horiz_step",
-        "scan_period",
-        "range_min",
-        "range_max",
-        "angle_min",
-        "angle_inc",
-        "time_inc",
-    )
-    scan_vals = struct.unpack_from("<8f", packet, off)
-    scan_info = dict(zip(scan_keys, scan_vals))
-    off += 32
+    # DataInfo (16 B at offset 12)
+    seq, payload_size, sec, nsec = struct.unpack_from("<IIII", payload, 12)
+    # Danity check: payload_size == packet_size - header(12) - tail(12)
+    if payload_size != packet_size - 24:
+        raise ValueError(f"payload_size mismatch: header says {payload_size}, expected {packet_size - 24}")
 
-    (point_num,) = struct.unpack_from("<I", packet, off)
-    off += 4
+    # InsideState (36 B at offset 28)
+    (
+        sys_rotation_period,
+        com_rotation_period,
+        dirty_index,
+        packet_lost_up,
+        packet_lost_down,
+        apd_temperature,
+        apd_voltage,
+        laser_voltage,
+        imu_temperature
+    ) = struct.unpack_from("<IIfffffff", payload, 28)
 
-    ranges_raw = np.frombuffer(packet, dtype="<H", count=point_num, offset=off)
-    off += point_num * 2
-    intensities = np.frombuffer(packet, dtype="B", count=point_num, offset=off)
-    off += point_num
+    # Calibration params (32 B at offset 64)
+    (
+        a_axis_dist,
+        b_axis_dist,
+        theta_angle_bias,
+        alpha_angle_bias,
+        beta_angle,
+        xi_angle,
+        range_bias,
+        range_scale
+    ) = struct.unpack_from("<ffffffff", payload, 64)
 
-    tail_crc, msg_type_check = struct.unpack_from("<II", packet, off)
-    crc_valid = (binascii.crc32(packet[:1032]) & 0xFFFFFFFF) == tail_crc
+    # Scan geometry and timing (32 B at offset 96)
+    (
+        h_angle_start,
+        h_angle_step,
+        scan_period,
+        range_min,
+        range_max,
+        angle_min,
+        angle_increment,
+        time_increment
+    ) = struct.unpack_from("<ffffffff", payload, 96)
 
-    rbias = calibration["range_bias"]
-    rscale = calibration["range_scale"]
-    ranges_m = (ranges_raw.astype(np.float32) * rscale + rbias) * 1e-3
+    # Point data begins at offset 128
+    point_num, = struct.unpack_from("<I", payload, 128)
+    if point_num > 300:
+        raise ValueError(f"point_num {point_num} exceeds max 300")
 
-    th = (
-        scan_info["horiz_start"]
-        + np.arange(point_num) * scan_info["horiz_step"]
-        + calibration["theta_bias"]
-    )
-    ph = (
-        scan_info["angle_min"]
-        + np.arange(point_num) * scan_info["angle_inc"]
-        + calibration["alpha_bias"]
-    )
+    # Fixed-size arrays of 300
+    ranges      = struct.unpack_from("<300H", payload, 132)
+    intensities = struct.unpack_from("<300B", payload, 732)
 
-    x = ranges_m * np.cos(ph) * np.cos(th)
-    y = ranges_m * np.cos(ph) * np.sin(th)
-    z = ranges_m * np.sin(ph)
+    points = [
+        {"distance_mm": ranges[i], "intensity": intensities[i]}
+        for i in range(point_num)
+    ]
 
-    points = np.stack((x, y, z, intensities.astype(np.float32)), axis=1)
+    # FrameTail is the last 12 bytes of payload
+    tail_off = packet_size - 12
+    crc32_recv, msg_type_check = struct.unpack_from("<II", payload, tail_off)
+    reserve, tail_bytes = struct.unpack_from("<2s2s", payload, tail_off + 8)
+
+    # Compute and compare CRC32
+    crc_computed = binascii.crc32(payload[:tail_off]) & 0xFFFFFFFF
 
     return {
-        "packet_type": packet_type,
-        "seq": seq,
-        "timestamp": (stamp_sec, stamp_nsec),
-        "sys_rot_period": sys_rot_period,
-        "com_rot_period": com_rot_period,
-        "temps_voltages": temps_voltages,
-        "calibration": calibration,
-        "scan_info": scan_info,
+        "udp_header": {
+            "src_port": src_port,
+            "dst_port": dst_port,
+            "length": udp_length,
+            "checksum": udp_checksum,
+        },
+        "lidar_header": {
+            "magic": magic,
+            "packet_type": packet_type,
+            "packet_size": packet_size,
+        },
+        "data_info": {
+            "seq": seq,
+            "payload_size": payload_size,
+            "sec": sec,
+            "nsec": nsec,
+        },
+        "inside_state": {
+            "sys_rotation_period": sys_rotation_period,
+            "com_rotation_period": com_rotation_period,
+            "dirty_index": dirty_index,
+            "packet_lost_up": packet_lost_up,
+            "packet_lost_down": packet_lost_down,
+            "apd_temperature": apd_temperature,
+            "apd_voltage": apd_voltage,
+            "laser_voltage": laser_voltage,
+            "imu_temperature": imu_temperature,
+        },
+        "calib_param": {
+            "a_axis_dist": a_axis_dist,
+            "b_axis_dist": b_axis_dist,
+            "theta_angle_bias": theta_angle_bias,
+            "alpha_angle_bias": alpha_angle_bias,
+            "beta_angle": beta_angle,
+            "xi_angle": xi_angle,
+            "range_bias": range_bias,
+            "range_scale": range_scale,
+        },
+        "geometry": {
+            "h_angle_start": h_angle_start,
+            "h_angle_step": h_angle_step,
+            "scan_period": scan_period,
+            "range_min": range_min,
+            "range_max": range_max,
+            "angle_min": angle_min,
+            "angle_increment": angle_increment,
+            "time_increment": time_increment,
+        },
         "point_num": point_num,
         "points": points,
-        "crc_valid": crc_valid,
+        "frame_tail": {
+            "crc32_recv": crc32_recv,
+            "msg_type_check": msg_type_check,
+            "reserve": reserve,
+            "tail_bytes": tail_bytes,
+        },
+        "crc_check": {
+            "received": crc32_recv,
+            "computed": crc_computed,
+            "ok": (crc32_recv == crc_computed),
+        },
     }
-
-
-def decode_file(path: str) -> dict:
-    with open(path, "rb") as f:
-        data = f.read(1044)
-    return decode_packet(data)
-
-
-def _print_summary(res: dict):
-    print(f"Packet Type: {res['packet_type']}  Seq: {res['seq']}")
-    sec, nsec = res["timestamp"]
-    print(f"Timestamp: {sec}s {nsec}ns  CRC OK: {res['crc_valid']}")
-    print("Calibration:", res["calibration"])
-    print("Scan info:", res["scan_info"])
-    print(f"Points ({res['point_num']}):")
-    for i, (x, y, z, inten) in enumerate(res["points"]):
-        print(f"{i:03d}: x={x:.3f} y={y:.3f} z={z:.3f}  inten={int(inten)}")
-
-
-if __name__ == "__main__":
-    import sys
-
-    if len(sys.argv) != 2:
-        print("Usage: python decode_lidar.py raw_packet.bin")
-        sys.exit(1)
-    result = decode_file(sys.argv[1])
-    _print_summary(result)
