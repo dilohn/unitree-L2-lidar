@@ -2,6 +2,8 @@
 
 This repository contains a set of Python tools for capturing, processing, and visualizing 3D LiDAR data over UDP from the Unitree 4D L2 LiDAR. At the time of me developing this, Unitree had tools available for Linux written in C/C++, but I needed something for Windows (and it would have been nice to have it in Python). This is more or less a refactor plus some additional bells and whistles for visualization.
 
+It is very important to note that these scripts will only decode packets if your sensor is set to: 3D point packet type, no IMU, normal mode (not negative angle). If you deviate, it is likely that the scripts will not correctly decode incoming packets. 
+
 ## decode_lidar_3d.py
 
 A utility module that decodes raw LiDAR packets from UDP data. It parses the binary packet format, extracting header information, calibration parameters, and point data. This module is used by the other scripts and provides the core functionality for interpreting the LiDAR sensor data. You can pass packets into this function and do whatever you want with what it returns.
@@ -17,7 +19,7 @@ A data capture utility that connects to a LiDAR sensor, collects data for a spec
 ## unpack_save.py
 
 A post-processing tool that reads the pickle file created by save.py and can export the data to different formats:
-- Generates a PLY file for use with 3D visualization software
+- Generates a PLY file for use with 3D visualization software (I just use Blender, which can also be scripted with Python)
 - Optionally can export to JSON format
 
 ## Network Info
